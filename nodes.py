@@ -7,11 +7,15 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
+import logging
+
 import comfy.model_management
 import folder_paths
+from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
@@ -307,25 +311,27 @@ def _stop_process(process: subprocess.Popen) -> None:
         process.wait(timeout=3)
 
 
-def _communicate_with_interrupt(process: subprocess.Popen, timeout_seconds: int) -> tuple[str, str]:
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        if comfy.model_management.processing_interrupted():
-            _stop_process(process)
-            comfy.model_management.throw_exception_if_processing_interrupted()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _stop_process(process)
-            raise TimeoutError(f"llama-cli timed out after {timeout_seconds}s")
-        try:
-            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-            return stdout, stderr
-        except subprocess.TimeoutExpired:
-            continue
+CHARS_PER_TOKEN_EST = 3
+THINK_OPEN_TAGS = (START_THINKING, "<think>", START_REDACTED)
+THINK_CLOSE_TAGS = (END_THINKING, "</think>", END_REDACTED)
+
+
+def _stage_logs(answer: str, seen: dict, started: float) -> None:
+    if not seen.get("gen"):
+        seen["gen"] = True
+        logging.info(f"[llama-cli] generation started ({time.monotonic() - started:.1f}s)")
+    if not seen.get("think"):
+        if any(tag in answer for tag in THINK_OPEN_TAGS):
+            seen["think"] = "open"
+            logging.info(f"[llama-cli] thinking... ({time.monotonic() - started:.1f}s)")
+    elif seen["think"] == "open":
+        if any(tag in answer for tag in THINK_CLOSE_TAGS):
+            seen["think"] = "closed"
+            logging.info(f"[llama-cli] thinking ended ({time.monotonic() - started:.1f}s)")
 
 
 def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[Path],
-                  prompt: str = "", chat: bool = True) -> tuple[str, str, str]:
+                  prompt: str = "", chat: bool = True, pb_max: int = 0) -> tuple[str, str, str]:
     try:
         process = subprocess.Popen(
             command,
@@ -335,13 +341,66 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
             text=True,
             encoding="utf-8",
             errors="replace",
-            shell=False,
+            bufsize=1,
         )
     except OSError as exc:
         raise RuntimeError(f"cannot start llama-cli ({command[0]}): {exc}") from exc
+
+    chunks: list[str] = []
+    err_chunks: list[str] = []
+    lock = threading.Lock()
+
+    def pump(stream, sink):
+        try:
+            while True:
+                piece = stream.read(16)
+                if not piece:
+                    break
+                with lock:
+                    sink.append(piece)
+        except (OSError, ValueError):
+            pass
+
+    t_out = threading.Thread(target=pump, args=(process.stdout, chunks), daemon=True)
+    t_err = threading.Thread(target=pump, args=(process.stderr, err_chunks), daemon=True)
     started = time.monotonic()
+    deadline = started + timeout_seconds
+    t_out.start()
+    t_err.start()
+    if pb_max:
+        logging.info(f"[llama-cli] loading model: {command[command.index('-m') + 1] if '-m' in command else '?'}")
+
+    pb = ProgressBar(pb_max) if pb_max else None
+    seen: dict = {}
     try:
-        stdout, stderr = _communicate_with_interrupt(process, timeout_seconds)
+        while t_out.is_alive() or t_err.is_alive():
+            if comfy.model_management.processing_interrupted():
+                _stop_process(process)
+                comfy.model_management.throw_exception_if_processing_interrupted()
+            if time.monotonic() > deadline:
+                _stop_process(process)
+                raise TimeoutError(f"llama-cli timed out after {timeout_seconds}s")
+            with lock:
+                buffer = "".join(chunks)
+            if "off" not in seen:
+                if chat:
+                    if prompt.strip():
+                        marker = "\n> " + prompt.strip().splitlines()[0]
+                        idx = buffer.find(marker)
+                        if idx != -1:
+                            seen["off"] = idx + len(marker)
+                elif buffer:
+                    seen["off"] = 0
+            if "off" in seen:
+                answer = buffer[seen["off"]:]
+                _stage_logs(answer, seen, started)
+                if pb is not None:
+                    est = min(pb_max - 1, len(answer) // CHARS_PER_TOKEN_EST)
+                    if est > pb.value and time.monotonic() - seen.get("pb_at", 0.0) > 0.25:
+                        pb.update_absolute(est)
+                        seen["pb_at"] = time.monotonic()
+            time.sleep(0.05)
+        process.wait()
     finally:
         for path in cleanup_paths:
             if path and path.exists():
@@ -349,13 +408,21 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
                     path.unlink()
                 except OSError:
                     pass
+
+    with lock:
+        stdout = "".join(chunks)
+        stderr = "".join(err_chunks)
     if process.returncode != 0:
         tail = (stderr or stdout or "").strip()
         raise RuntimeError(
             f"llama-cli exited with code {process.returncode}:\n"
             f"{'\n'.join(tail.splitlines()[-15:])}"
         )
-    return parse_response(stdout, stderr, time.monotonic() - started, prompt, chat)
+    text, reasoning, stats = parse_response(stdout, stderr, time.monotonic() - started, prompt, chat)
+    if pb:
+        pb.update_absolute(pb_max)
+        logging.info(f"[llama-cli] done: {stats}")
+    return text, reasoning, stats
 
 
 def parse_response(stdout: str, stderr: str, wall: float, prompt: str = "", chat: bool = True) -> tuple[str, str, str]:
@@ -556,7 +623,7 @@ class LlamaCliTextGenerate(io.ComfyNode):
             args["image_files"] = ",".join(str(p) for p in pngs)
 
         command = build_command(cli, model_path, args)
-        text, reasoning, stats = run_llama_cli(command, int(timeout), cleanup, prompt_text, chat)
+        text, reasoning, stats = run_llama_cli(command, int(timeout), cleanup, prompt_text, chat, pb_max=int(max_length))
         return io.NodeOutput(text, reasoning, stats)
 
 
