@@ -1,0 +1,2 @@
+# Optional: point to a llama.cpp bin dir (or llama-cli.exe) to override the built-in
+# vendor copy. Leave empty to use vendor/llama-b10472 bundled in this pack.
