@@ -20,6 +20,7 @@ from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
 PERF_RE = re.compile(r"\[\s*Prompt:[^|\]]+\|\s*Generation:[^\]]+\]")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 START_THINKING = "[Start thinking]"
 END_THINKING = "[End thinking]"
 START_REDACTED = "[Start thinking (redacted)]"
@@ -382,6 +383,8 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
                 raise TimeoutError(f"llama-cli timed out after {timeout_seconds}s")
             with lock:
                 buffer = "".join(chunks)
+            if ANSI_RE.search(buffer):
+                buffer = ANSI_RE.sub("", buffer)
             if "off" not in seen:
                 if chat:
                     if prompt.strip():
@@ -396,8 +399,9 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
                 _stage_logs(answer, seen, started)
                 if pb is not None:
                     est = min(pb_max - 1, len(answer) // CHARS_PER_TOKEN_EST)
-                    if est > pb.value and time.monotonic() - seen.get("pb_at", 0.0) > 0.25:
+                    if est > seen.get("last_est", 0) and time.monotonic() - seen.get("pb_at", 0.0) > 0.25:
                         pb.update_absolute(est)
+                        seen["last_est"] = est
                         seen["pb_at"] = time.monotonic()
             time.sleep(0.05)
         process.wait()
@@ -410,8 +414,8 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
                     pass
 
     with lock:
-        stdout = "".join(chunks)
-        stderr = "".join(err_chunks)
+        stdout = ANSI_RE.sub("", "".join(chunks))
+        stderr = ANSI_RE.sub("", "".join(err_chunks))
     if process.returncode != 0:
         tail = (stderr or stdout or "").strip()
         raise RuntimeError(
