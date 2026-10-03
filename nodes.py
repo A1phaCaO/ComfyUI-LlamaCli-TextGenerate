@@ -431,7 +431,7 @@ class LlamaCliTextGenerate(io.ComfyNode):
                 io.Combo.Input("model", options=list_gguf_models() or [""],
                                tooltip="Scans ComfyUI model folders (LLM, clip, text_encoders, diffusion_models, checkpoints, ...) for *.gguf. "
                                        "For files outside them use model_path_override. List refreshes within ~30s after F5."),
-                io.String.Input("model_path_override", default="", advanced=True, force_input=True,
+                io.String.Input("model_path_override", default="", advanced=True, force_input=True, optional=True,
                                 tooltip="Absolute path (or relative to the ComfyUI models dir) to a GGUF outside the scanned folders. Wins over model."),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True, default=""),
                 io.Image.Input("image", optional=True),
