@@ -17,6 +17,7 @@ import comfy.model_management
 import folder_paths
 from comfy.utils import ProgressBar
 from comfy_api.latest import ComfyExtension, io
+from tqdm import tqdm
 from typing_extensions import override
 
 PERF_RE = re.compile(r"\[\s*Prompt:[^|\]]+\|\s*Generation:[^\]]+\]")
@@ -317,18 +318,24 @@ THINK_OPEN_TAGS = (START_THINKING, "<think>", START_REDACTED)
 THINK_CLOSE_TAGS = (END_THINKING, "</think>", END_REDACTED)
 
 
-def _stage_logs(answer: str, seen: dict, started: float) -> None:
+def _stage_logs(answer: str, seen: dict, started: float, out=None) -> None:
+    def say(msg: str) -> None:
+        if out is not None:
+            out.write(msg)
+        else:
+            logging.info(msg)
+
     if not seen.get("gen"):
         seen["gen"] = True
-        logging.info(f"[llama-cli] generation started ({time.monotonic() - started:.1f}s)")
+        say(f"[llama-cli] generation started ({time.monotonic() - started:.1f}s)")
     if not seen.get("think"):
         if any(tag in answer for tag in THINK_OPEN_TAGS):
             seen["think"] = "open"
-            logging.info(f"[llama-cli] thinking... ({time.monotonic() - started:.1f}s)")
+            say(f"[llama-cli] thinking... ({time.monotonic() - started:.1f}s)")
     elif seen["think"] == "open":
         if any(tag in answer for tag in THINK_CLOSE_TAGS):
             seen["think"] = "closed"
-            logging.info(f"[llama-cli] thinking ended ({time.monotonic() - started:.1f}s)")
+            say(f"[llama-cli] thinking ended ({time.monotonic() - started:.1f}s)")
 
 
 def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[Path],
@@ -372,6 +379,7 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
         logging.info(f"[llama-cli] loading model: {command[command.index('-m') + 1] if '-m' in command else '?'}")
 
     pb = ProgressBar(pb_max) if pb_max else None
+    pbar = tqdm(total=pb_max, unit="tok", desc="llama.cpp", leave=True) if pb_max else None
     seen: dict = {}
     try:
         while t_out.is_alive() or t_err.is_alive():
@@ -396,16 +404,24 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
                     seen["off"] = 0
             if "off" in seen:
                 answer = buffer[seen["off"]:]
-                _stage_logs(answer, seen, started)
-                if pb is not None:
+                _stage_logs(answer, seen, started, out=pbar)
+                if pb_max:
                     est = min(pb_max - 1, len(answer) // CHARS_PER_TOKEN_EST)
                     if est > seen.get("last_est", 0) and time.monotonic() - seen.get("pb_at", 0.0) > 0.25:
-                        pb.update_absolute(est)
+                        if pb is not None:
+                            pb.update_absolute(est)
+                        if pbar is not None:
+                            pbar.update(est - pbar.n)
                         seen["last_est"] = est
                         seen["pb_at"] = time.monotonic()
             time.sleep(0.05)
         process.wait()
+        if pbar is not None:
+            pbar.update(max(0, pb_max - pbar.n))
+            pbar.close()
     finally:
+        if pbar is not None and not pbar.disable:
+            pbar.close()
         for path in cleanup_paths:
             if path and path.exists():
                 try:
@@ -423,9 +439,9 @@ def run_llama_cli(command: list[str], timeout_seconds: int, cleanup_paths: list[
             f"{'\n'.join(tail.splitlines()[-15:])}"
         )
     text, reasoning, stats = parse_response(stdout, stderr, time.monotonic() - started, prompt, chat)
-    if pb:
+    if pb is not None:
         pb.update_absolute(pb_max)
-        logging.info(f"[llama-cli] done: {stats}")
+    logging.info(f"[llama-cli] done: {stats}")
     return text, reasoning, stats
 
 
