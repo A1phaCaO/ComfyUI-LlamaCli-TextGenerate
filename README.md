@@ -1,4 +1,4 @@
-# ComfyUI-LlamaCli-TextGenerate
+# ComfyUI-LlamaCli-TextGenerate（vibe coding产物🤗）
 
 用 llama.cpp（`llama-cli` 子进程）在工作流里跑 GGUF 文本生成，输入/输出对齐原版
 Generate Text（`TextGenerate`）节点，但模型来源完全不受 ComfyUI 模型目录限制，
